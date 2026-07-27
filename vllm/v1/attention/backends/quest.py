@@ -10,15 +10,18 @@ Sparse page selection and sparse KV reads are added in later stages.
 """
 
 import os
+from dataclasses import dataclass, fields
 from typing import Any
 
 import torch
 
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,
     FlashAttentionMetadata,
+    FlashAttentionMetadataBuilder,
 )
 
 QUEST_NUM_DENSE_LAYERS = 2
@@ -49,6 +52,52 @@ def get_quest_page_budget_percent() -> float:
         )
 
     return page_budget_percent
+
+
+@dataclass
+class QuestAttentionMetadata(FlashAttentionMetadata):
+    """FlashAttention metadata extended with exact request phase state."""
+
+    is_prefilling: torch.Tensor | None = None
+
+    @classmethod
+    def from_flash_attention_metadata(
+        cls,
+        metadata: FlashAttentionMetadata,
+        is_prefilling: torch.Tensor | None,
+    ) -> "QuestAttentionMetadata":
+        """Copy FlashAttention metadata and attach the scheduler phase flag."""
+
+        base_values = {
+            field.name: getattr(metadata, field.name)
+            for field in fields(FlashAttentionMetadata)
+        }
+
+        return cls(
+            **base_values,
+            is_prefilling=is_prefilling,
+        )
+
+
+class QuestAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
+    """Build FlashAttention metadata plus QuEST's exact phase signal."""
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> QuestAttentionMetadata:
+        flash_metadata = super().build(
+            common_prefix_len=common_prefix_len,
+            common_attn_metadata=common_attn_metadata,
+            fast_build=fast_build,
+        )
+
+        return QuestAttentionMetadata.from_flash_attention_metadata(
+            metadata=flash_metadata,
+            is_prefilling=common_attn_metadata.is_prefilling,
+        )
 
 
 class QuestAttentionImpl(FlashAttentionImpl):
@@ -123,6 +172,24 @@ class QuestAttentionImpl(FlashAttentionImpl):
             output_block_scale,
         )
 
+    @staticmethod
+    def _requires_dense_phase(
+        attn_metadata: FlashAttentionMetadata,
+    ) -> bool:
+        """Return whether this batch must use dense attention.
+
+        Missing phase metadata falls back to dense attention. A mixed batch
+        containing any prefill request also remains entirely dense during the
+        initial single-request QuEST implementation.
+        """
+
+        is_prefilling = getattr(attn_metadata, "is_prefilling", None)
+
+        if is_prefilling is None or is_prefilling.numel() == 0:
+            return True
+
+        return bool(torch.any(is_prefilling).item())
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -146,6 +213,21 @@ class QuestAttentionImpl(FlashAttentionImpl):
         This separation establishes the control flow that sparse decode will
         replace later.
         """
+
+        # Prefill remains dense for every layer. Mixed prefill/decode batches
+        # also remain dense until broader batching support is implemented.
+        if self._requires_dense_phase(attn_metadata):
+            return self._forward_dense(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                output_scale,
+                output_block_scale,
+            )
 
         layer_index = extract_layer_index(layer.layer_name)
 
@@ -189,3 +271,7 @@ class QuestAttentionBackend(FlashAttentionBackend):
     @staticmethod
     def get_impl_cls() -> type[QuestAttentionImpl]:
         return QuestAttentionImpl
+
+    @staticmethod
+    def get_builder_cls() -> type[QuestAttentionMetadataBuilder]:
+        return QuestAttentionMetadataBuilder
