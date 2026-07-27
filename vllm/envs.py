@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_TRITON_ATTN_USE_TD: bool | None = None
+    VLLM_QUEST_PAGE_BUDGET_PERCENT: float = 100.0
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
@@ -586,6 +587,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ``0`` forces TD off.  Useful for A/B benchmarking the TD path.
     "VLLM_TRITON_ATTN_USE_TD": lambda: {"1": True, "0": False}.get(
         os.getenv("VLLM_TRITON_ATTN_USE_TD", "").strip()
+    ),
+    # Percentage of KV pages available to the QuEST decode path.
+    "VLLM_QUEST_PAGE_BUDGET_PERCENT": lambda: float(
+        os.getenv("VLLM_QUEST_PAGE_BUDGET_PERCENT", "100")
     ),
     # If set, enable PyTorch's GPU<->CPU synchronization debug mode around
     # the worker's `execute_model` and `sample_tokens` calls. Valid values
