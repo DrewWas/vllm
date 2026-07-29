@@ -17,6 +17,7 @@ import torch
 
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.ops.quest import QuestPageMetadata
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,
@@ -107,6 +108,7 @@ class QuestAttentionImpl(FlashAttentionImpl):
         super().__init__(*args, **kwargs)
 
         self.quest_page_budget_percent = get_quest_page_budget_percent()
+        self.quest_page_metadata: QuestPageMetadata | None = None
 
         if self.quest_page_budget_percent != 100.0:
             raise NotImplementedError(
@@ -114,6 +116,54 @@ class QuestAttentionImpl(FlashAttentionImpl):
                 f"{QUEST_PAGE_BUDGET_PERCENT_ENV} must remain 100, "
                 f"but received {self.quest_page_budget_percent}."
             )
+
+    def _get_or_create_page_metadata(
+        self,
+        kv_cache: torch.Tensor,
+    ) -> QuestPageMetadata:
+        """Return this layer's QuEST metadata, allocating it if necessary."""
+
+        metadata = self.quest_page_metadata
+
+        if metadata is None:
+            metadata = QuestPageMetadata.allocate_from_kv_cache(
+                kv_cache=kv_cache,
+                expected_num_kv_heads=self.num_kv_heads,
+                expected_head_size=self.head_size,
+            )
+            self.quest_page_metadata = metadata
+            return metadata
+
+        expected_shape = (
+            metadata.num_blocks,
+            2,
+            metadata.block_size,
+            self.num_kv_heads,
+            self.head_size,
+        )
+
+        if tuple(kv_cache.shape) != expected_shape:
+            raise RuntimeError(
+                "The KV-cache shape changed after QuEST metadata "
+                f"allocation: expected {expected_shape}, "
+                f"received {tuple(kv_cache.shape)}."
+            )
+
+        if metadata.key_min.device != kv_cache.device:
+            raise RuntimeError(
+                "The KV-cache device changed after QuEST metadata "
+                f"allocation: expected {metadata.key_min.device}, "
+                f"received {kv_cache.device}."
+            )
+
+        if metadata.key_min.dtype != kv_cache.dtype:
+            raise RuntimeError(
+                "The KV-cache dtype changed after QuEST metadata "
+                f"allocation: expected {metadata.key_min.dtype}, "
+                f"received {kv_cache.dtype}."
+            )
+
+        return metadata
 
     def _forward_dense(
         self,
@@ -214,6 +264,24 @@ class QuestAttentionImpl(FlashAttentionImpl):
         replace later.
         """
 
+        layer_index = extract_layer_index(layer.layer_name)
+
+        # Allocate sidecar metadata for QuEST-enabled layers. Allocation happens
+        # during prefill so the container is ready before the first decode step.
+        if (
+            layer_index >= QUEST_NUM_DENSE_LAYERS
+            and attn_metadata is not None
+            and kv_cache.numel() > 0
+        ):
+            page_metadata = self._get_or_create_page_metadata(kv_cache)
+
+            # Update the sidecar metadata from the same RoPE-transformed keys
+            # and physical slot mapping used by the ordinary KV-cache write.
+            page_metadata.update_from_key_slots(
+                key=key,
+                slot_mapping=attn_metadata.slot_mapping,
+            )
+
         # Prefill remains dense for every layer. Mixed prefill/decode batches
         # also remain dense until broader batching support is implemented.
         if self._requires_dense_phase(attn_metadata):
@@ -228,8 +296,6 @@ class QuestAttentionImpl(FlashAttentionImpl):
                 output_scale,
                 output_block_scale,
             )
-
-        layer_index = extract_layer_index(layer.layer_name)
 
         if layer_index < QUEST_NUM_DENSE_LAYERS:
             return self._forward_dense(
