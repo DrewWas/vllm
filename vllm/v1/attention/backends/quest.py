@@ -110,6 +110,13 @@ class QuestAttentionImpl(FlashAttentionImpl):
         self.quest_page_budget_percent = get_quest_page_budget_percent()
         self.quest_page_metadata: QuestPageMetadata | None = None
 
+        # QUEST_ROUTE_TRACE
+        self.quest_debug = os.getenv("QUEST_DEBUG", "0") == "1"
+        self._logged_metadata = False
+        self._logged_prefill = False
+        self._logged_dense_decode = False
+        self._logged_quest_decode = False
+
         if self.quest_page_budget_percent != 100.0:
             raise NotImplementedError(
                 "Sparse QuEST attention is not implemented yet. "
@@ -275,6 +282,14 @@ class QuestAttentionImpl(FlashAttentionImpl):
         ):
             page_metadata = self._get_or_create_page_metadata(kv_cache)
 
+            if self.quest_debug and not self._logged_metadata:
+                print(
+                    f"[QUEST] layer={layer_index} "
+                    f"metadata_shape={tuple(page_metadata.key_min.shape)}",
+                    flush=True,
+                )
+                self._logged_metadata = True
+
             # Update the sidecar metadata from the same RoPE-transformed keys
             # and physical slot mapping used by the ordinary KV-cache write.
             page_metadata.update_from_key_slots(
@@ -285,6 +300,14 @@ class QuestAttentionImpl(FlashAttentionImpl):
         # Prefill remains dense for every layer. Mixed prefill/decode batches
         # also remain dense until broader batching support is implemented.
         if self._requires_dense_phase(attn_metadata):
+            if self.quest_debug and not self._logged_prefill:
+                print(
+                    f"[QUEST] layer={layer_index} "
+                    "route=dense phase=prefill_or_mixed",
+                    flush=True,
+                )
+                self._logged_prefill = True
+
             return self._forward_dense(
                 layer,
                 query,
@@ -298,6 +321,14 @@ class QuestAttentionImpl(FlashAttentionImpl):
             )
 
         if layer_index < QUEST_NUM_DENSE_LAYERS:
+            if self.quest_debug and not self._logged_dense_decode:
+                print(
+                    f"[QUEST] layer={layer_index} "
+                    "route=dense phase=decode",
+                    flush=True,
+                )
+                self._logged_dense_decode = True
+
             return self._forward_dense(
                 layer,
                 query,
@@ -309,6 +340,15 @@ class QuestAttentionImpl(FlashAttentionImpl):
                 output_scale,
                 output_block_scale,
             )
+
+        if self.quest_debug and not self._logged_quest_decode:
+            print(
+                f"[QUEST] layer={layer_index} "
+                "route=quest_reference phase=decode "
+                f"budget={self.quest_page_budget_percent}",
+                flush=True,
+            )
+            self._logged_quest_decode = True
 
         # QuEST 100%-budget reference path.
         #
