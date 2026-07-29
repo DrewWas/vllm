@@ -21,8 +21,8 @@ class QuestPageMetadata:
 
     key_min: torch.Tensor
     key_max: torch.Tensor
-    valid_tokens: torch.Tensor
-    initialized: torch.Tensor
+    # 0 means uninitialized/stale; 1..block_size is occupancy.
+    num_valid_tokens: torch.Tensor
     block_size: int
 
     @classmethod
@@ -105,14 +105,9 @@ class QuestPageMetadata:
                 dtype=kv_cache.dtype,
                 device=kv_cache.device,
             ),
-            valid_tokens=torch.zeros(
+            num_valid_tokens=torch.zeros(
                 num_blocks,
-                dtype=torch.int32,
-                device=kv_cache.device,
-            ),
-            initialized=torch.zeros(
-                num_blocks,
-                dtype=torch.bool,
+                dtype=torch.uint8,
                 device=kv_cache.device,
             ),
             block_size=block_size,
@@ -214,7 +209,18 @@ class QuestPageMetadata:
             incoming_min = page_keys.amin(dim=0)
             incoming_max = page_keys.amax(dim=0)
 
-            if bool(self.initialized[page_index].item()):
+            current_valid_tokens = int(
+                self.num_valid_tokens[page_index].item()
+            )
+            resets_page = bool(torch.any(page_offsets == 0).item())
+
+            # Offset zero begins a new lifetime for this physical page.
+            # Do not merge keys from the page's previous owner.
+            if resets_page or current_valid_tokens == 0:
+                self.key_min[page_index].copy_(incoming_min)
+                self.key_max[page_index].copy_(incoming_max)
+                current_valid_tokens = 0
+            else:
                 self.key_min[page_index].copy_(
                     torch.minimum(
                         self.key_min[page_index],
@@ -227,14 +233,10 @@ class QuestPageMetadata:
                         incoming_max,
                     )
                 )
-            else:
-                self.key_min[page_index].copy_(incoming_min)
-                self.key_max[page_index].copy_(incoming_max)
-                self.initialized[page_index] = True
 
             incoming_valid_tokens = int(page_offsets.max().item()) + 1
-            self.valid_tokens[page_index] = max(
-                int(self.valid_tokens[page_index].item()),
+            self.num_valid_tokens[page_index] = max(
+                current_valid_tokens,
                 incoming_valid_tokens,
             )
 
@@ -308,8 +310,9 @@ class QuestPageMetadata:
 
         self.key_min.copy_(keys_for_min.amin(dim=1))
         self.key_max.copy_(keys_for_max.amax(dim=1))
-        self.valid_tokens.copy_(valid_tokens)
-        self.initialized.copy_(valid_tokens > 0)
+        self.num_valid_tokens.copy_(
+            valid_tokens.to(dtype=torch.uint8)
+        )
 
     @property
     def num_blocks(self) -> int:
@@ -324,8 +327,7 @@ class QuestPageMetadata:
         tensors = (
             self.key_min,
             self.key_max,
-            self.valid_tokens,
-            self.initialized,
+            self.num_valid_tokens,
         )
 
         return sum(

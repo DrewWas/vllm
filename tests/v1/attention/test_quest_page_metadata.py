@@ -67,8 +67,7 @@ def test_rebuild_masks_unused_page_slots() -> None:
         valid_keys.amax(dim=0),
     )
 
-    assert metadata.valid_tokens.tolist() == [3, 0]
-    assert metadata.initialized.tolist() == [True, False]
+    assert metadata.num_valid_tokens.tolist() == [3, 0]
     assert bool(torch.all(torch.isposinf(metadata.key_min[1])))
     assert bool(torch.all(torch.isneginf(metadata.key_max[1])))
 
@@ -102,7 +101,7 @@ def test_incremental_update_filters_padding_and_appends() -> None:
         valid_prefill_keys.amax(dim=0),
     )
 
-    assert metadata.valid_tokens.tolist() == [2, 0]
+    assert metadata.num_valid_tokens.tolist() == [2, 0]
 
     decode_key = torch.tensor(
         [[[-5, 9, 2, 10], [8, 30, 26, 55]]],
@@ -128,5 +127,43 @@ def test_incremental_update_filters_padding_and_appends() -> None:
         all_valid_keys.amax(dim=0),
     )
 
-    assert metadata.valid_tokens.tolist() == [3, 0]
-    assert metadata.initialized.tolist() == [True, False]
+    assert metadata.num_valid_tokens.tolist() == [3, 0]
+
+
+def test_offset_zero_overwrites_reused_physical_page() -> None:
+    _, metadata = make_metadata(num_blocks=1)
+
+    old_keys = torch.tensor(
+        [
+            [[-100, 100, -50, 50], [-80, 80, -40, 40]],
+            [[-90, 90, -45, 45], [-70, 70, -35, 35]],
+            [[-85, 85, -42, 42], [-60, 60, -30, 30]],
+        ],
+        dtype=torch.float32,
+    )
+    metadata.update_from_key_slots(
+        key=old_keys,
+        slot_mapping=torch.tensor([0, 1, 2]),
+    )
+
+    replacement_keys = torch.tensor(
+        [
+            [[1, 2, 3, 4], [10, 20, 30, 40]],
+            [[5, 6, 7, 8], [50, 60, 70, 80]],
+        ],
+        dtype=torch.float32,
+    )
+    metadata.update_from_key_slots(
+        key=replacement_keys,
+        slot_mapping=torch.tensor([0, 1]),
+    )
+
+    torch.testing.assert_close(
+        metadata.key_min[0],
+        replacement_keys.amin(dim=0),
+    )
+    torch.testing.assert_close(
+        metadata.key_max[0],
+        replacement_keys.amax(dim=0),
+    )
+    assert metadata.num_valid_tokens.tolist() == [2]

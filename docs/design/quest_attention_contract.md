@@ -3,6 +3,7 @@
 ## Baseline
 
 - vLLM version: 0.25.0
+- Model runner: V1 only (`VLLM_USE_V2_MODEL_RUNNER=0` is required)
 - Baseline commit: 702f4814fe54fabff350d43cb753ae3e47c0c276
 - Model: meta-llama/Llama-3.1-8B-Instruct
 - GPU: NVIDIA H100 80GB HBM3
