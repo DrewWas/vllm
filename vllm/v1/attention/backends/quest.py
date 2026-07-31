@@ -19,13 +19,16 @@ import torch
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.ops.quest import QuestPageMetadata
-from vllm.v1.attention.ops.quest.reference import reference_quest_decode
+from vllm.v1.attention.ops.quest.vectorized import (
+    vectorized_quest_decode_batch1,
+)
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,
     FlashAttentionMetadata,
     FlashAttentionMetadataBuilder,
 )
+from vllm.v1.attention.ops.quest.selection_logger import capture_quest_page_selection
 
 QUEST_NUM_DENSE_LAYERS = 2
 QUEST_PAGE_BUDGET_PERCENT_ENV = "VLLM_QUEST_PAGE_BUDGET_PERCENT"
@@ -295,11 +298,16 @@ class QuestAttentionImpl(FlashAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Execute Quest using the configured live page budget."""
+        """Execute vectorized batch-1 Quest decode.
+
+        Quest runs for every decode token in layers 2 and above. The sparse
+        threshold controls only whether the configured reduced page budget
+        applies. At or below the threshold, Quest attends every valid page.
+        """
 
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
-                "The Quest PyTorch reference does not support fused "
+                "The vectorized Quest MVP does not support fused "
                 "output quantization."
             )
 
@@ -311,20 +319,22 @@ class QuestAttentionImpl(FlashAttentionImpl):
 
         if attn_metadata.max_query_len != 1:
             raise RuntimeError(
-                "The Quest PyTorch reference currently supports only "
+                "The vectorized Quest MVP supports only "
                 "single-token decode."
             )
 
         num_tokens = attn_metadata.num_actual_tokens
 
-        # Explicit batch=1 restriction for the current MVP.
         if num_tokens != 1 or attn_metadata.seq_lens.numel() != 1:
             raise RuntimeError(
-                "The Quest MVP currently supports exactly one active "
+                "The vectorized Quest MVP supports exactly one active "
                 "decode request."
             )
 
-        sequence_length = int(attn_metadata.seq_lens[0].item())
+        # Batch=1 makes max_seq_len the exact current request length.
+        # Using this host-side integer avoids seq_lens[0].item(), which
+        # would introduce one CUDA synchronization per Quest layer.
+        sequence_length = attn_metadata.max_seq_len
 
         budget = compute_quest_budget(
             sequence_length=sequence_length,
@@ -333,16 +343,24 @@ class QuestAttentionImpl(FlashAttentionImpl):
             sparse_start_tokens=self.quest_sparse_start_tokens,
         )
 
-        result = reference_quest_decode(
+        result = vectorized_quest_decode_batch1(
             query=query[:num_tokens],
             kv_cache=kv_cache,
             page_min=page_metadata.key_min,
             page_max=page_metadata.key_max,
             block_table=attn_metadata.block_table[:num_tokens],
-            seq_lens=attn_metadata.seq_lens[:num_tokens],
+            sequence_length=sequence_length,
             page_budget=budget.selected_pages,
             block_size=page_metadata.block_size,
             scale=self.scale,
+        )
+
+        capture_quest_page_selection(
+            layer_idx=extract_layer_index(layer.layer_name),
+            sequence_length=sequence_length,
+            physical_page_ids=(
+                result.selection.physical_page_ids
+            ),
         )
 
         output_view = output.view(
@@ -353,6 +371,7 @@ class QuestAttentionImpl(FlashAttentionImpl):
         output_view[:num_tokens].copy_(result.output)
 
         return output
+
 
 
     @staticmethod
@@ -470,13 +489,13 @@ class QuestAttentionImpl(FlashAttentionImpl):
         if self.quest_debug and not self._logged_quest_decode:
             print(
                 f"[QUEST] layer={layer_index} "
-                "route=quest_reference phase=decode "
+                "route=quest_vectorized phase=decode "
                 f"budget={self.quest_page_budget_percent}",
                 flush=True,
             )
             self._logged_quest_decode = True
 
-        # QuEST 100%-budget reference path.
+        # Vectorized Quest decode path.
         #
         # This deliberately reads the full KV cache through FlashAttention.
         # Sparse page selection will replace only this branch in later stages.
