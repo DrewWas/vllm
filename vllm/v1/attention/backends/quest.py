@@ -18,6 +18,7 @@ import torch
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.ops.quest import QuestPageMetadata
+from vllm.v1.attention.ops.quest.reference import reference_quest_decode
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,
@@ -210,24 +211,59 @@ class QuestAttentionImpl(FlashAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Execute the 100%-budget QuEST reference branch.
+        """Execute full-budget Quest using the PyTorch reference."""
 
-        This remains dense until sparse page selection is implemented.
-        Keeping it separate makes layer routing testable and provides the
-        replacement point for the future sparse decode implementation.
-        """
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError(
+                "The Quest PyTorch reference does not support fused "
+                "output quantization."
+            )
 
-        return self._forward_dense(
-            layer,
-            query,
-            key,
-            value,
-            kv_cache,
-            attn_metadata,
-            output,
-            output_scale,
-            output_block_scale,
+        page_metadata = self.quest_page_metadata
+        if page_metadata is None:
+            raise RuntimeError(
+                "Quest page metadata was not allocated before decode."
+            )
+
+        # The current MVP supports ordinary one-token decode only. Every
+        # actual query token therefore corresponds to one request row.
+        if attn_metadata.max_query_len != 1:
+            raise RuntimeError(
+                "The Quest PyTorch reference currently supports only "
+                "single-token decode."
+            )
+
+        num_tokens = attn_metadata.num_actual_tokens
+
+        if num_tokens != attn_metadata.seq_lens.shape[0]:
+            raise RuntimeError(
+                "Quest reference requires one decode token per request: "
+                f"received {num_tokens} tokens and "
+                f"{attn_metadata.seq_lens.shape[0]} requests."
+            )
+
+        result = reference_quest_decode(
+            query=query[:num_tokens],
+            kv_cache=kv_cache,
+            page_min=page_metadata.key_min,
+            page_max=page_metadata.key_max,
+            block_table=attn_metadata.block_table[:num_tokens],
+            seq_lens=attn_metadata.seq_lens[:num_tokens],
+            page_budget=attn_metadata.block_table.shape[1],
+            block_size=page_metadata.block_size,
+            scale=self.scale,
         )
+
+        # vLLM may expose output as either [T, Hq, D] or flattened
+        # [T, Hq * D] storage.
+        output_view = output.view(
+            output.shape[0],
+            self.num_heads,
+            self.head_size,
+        )
+        output_view[:num_tokens].copy_(result.output)
+
+        return output
 
     @staticmethod
     def _requires_dense_phase(
