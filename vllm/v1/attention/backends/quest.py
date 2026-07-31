@@ -9,6 +9,7 @@ remaining numerically equivalent to dense FlashAttention.
 Sparse page selection and sparse KV reads are added in later stages.
 """
 
+import math
 import os
 from dataclasses import dataclass, fields
 from typing import Any
@@ -29,6 +30,94 @@ from vllm.v1.attention.backends.flash_attn import (
 QUEST_NUM_DENSE_LAYERS = 2
 QUEST_PAGE_BUDGET_PERCENT_ENV = "VLLM_QUEST_PAGE_BUDGET_PERCENT"
 QUEST_DEFAULT_PAGE_BUDGET_PERCENT = 100.0
+QUEST_SPARSE_START_TOKENS_ENV = "VLLM_QUEST_SPARSE_START_TOKENS"
+QUEST_DEFAULT_SPARSE_START_TOKENS = 8192
+
+
+@dataclass(frozen=True)
+class QuestBudgetDecision:
+    """Resolved Quest page budget for one decode sequence."""
+
+    sequence_length: int
+    valid_pages: int
+    selected_pages: int
+    sparse_active: bool
+
+    @property
+    def effective_percent(self) -> float:
+        return 100.0 * self.selected_pages / self.valid_pages
+
+
+def get_quest_sparse_start_tokens() -> int:
+    """Read the sequence-length threshold for sparse Quest decode."""
+
+    raw_value = os.getenv(
+        QUEST_SPARSE_START_TOKENS_ENV,
+        str(QUEST_DEFAULT_SPARSE_START_TOKENS),
+    )
+
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{QUEST_SPARSE_START_TOKENS_ENV} must be an integer, "
+            f"but received {raw_value!r}."
+        ) from exc
+
+    if value < 0:
+        raise ValueError(
+            f"{QUEST_SPARSE_START_TOKENS_ENV} must be non-negative, "
+            f"but received {value}."
+        )
+
+    return value
+
+
+def compute_quest_budget(
+    *,
+    sequence_length: int,
+    block_size: int,
+    budget_percent: float,
+    sparse_start_tokens: int,
+) -> QuestBudgetDecision:
+    """Resolve the number of valid and selected pages for one request."""
+
+    if sequence_length <= 0:
+        raise ValueError("sequence_length must be positive")
+
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+
+    if not 0.0 < budget_percent <= 100.0:
+        raise ValueError(
+            "budget_percent must be greater than 0 and at most 100"
+        )
+
+    if sparse_start_tokens < 0:
+        raise ValueError("sparse_start_tokens must be non-negative")
+
+    valid_pages = math.ceil(sequence_length / block_size)
+
+    sparse_active = (
+        sequence_length > sparse_start_tokens
+        and budget_percent < 100.0
+    )
+
+    if sparse_active:
+        selected_pages = max(
+            1,
+            math.ceil(valid_pages * budget_percent / 100.0),
+        )
+        selected_pages = min(selected_pages, valid_pages)
+    else:
+        selected_pages = valid_pages
+
+    return QuestBudgetDecision(
+        sequence_length=sequence_length,
+        valid_pages=valid_pages,
+        selected_pages=selected_pages,
+        sparse_active=sparse_active,
+    )
 
 
 def get_quest_page_budget_percent() -> float:
@@ -109,6 +198,7 @@ class QuestAttentionImpl(FlashAttentionImpl):
         super().__init__(*args, **kwargs)
 
         self.quest_page_budget_percent = get_quest_page_budget_percent()
+        self.quest_sparse_start_tokens = get_quest_sparse_start_tokens()
         self.quest_page_metadata: QuestPageMetadata | None = None
 
         # QUEST_ROUTE_TRACE
@@ -118,12 +208,6 @@ class QuestAttentionImpl(FlashAttentionImpl):
         self._logged_dense_decode = False
         self._logged_quest_decode = False
 
-        if self.quest_page_budget_percent != 100.0:
-            raise NotImplementedError(
-                "Sparse QuEST attention is not implemented yet. "
-                f"{QUEST_PAGE_BUDGET_PERCENT_ENV} must remain 100, "
-                f"but received {self.quest_page_budget_percent}."
-            )
 
     def _get_or_create_page_metadata(
         self,
@@ -211,7 +295,7 @@ class QuestAttentionImpl(FlashAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Execute full-budget Quest using the PyTorch reference."""
+        """Execute Quest using the configured live page budget."""
 
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
@@ -225,8 +309,6 @@ class QuestAttentionImpl(FlashAttentionImpl):
                 "Quest page metadata was not allocated before decode."
             )
 
-        # The current MVP supports ordinary one-token decode only. Every
-        # actual query token therefore corresponds to one request row.
         if attn_metadata.max_query_len != 1:
             raise RuntimeError(
                 "The Quest PyTorch reference currently supports only "
@@ -235,12 +317,21 @@ class QuestAttentionImpl(FlashAttentionImpl):
 
         num_tokens = attn_metadata.num_actual_tokens
 
-        if num_tokens != attn_metadata.seq_lens.shape[0]:
+        # Explicit batch=1 restriction for the current MVP.
+        if num_tokens != 1 or attn_metadata.seq_lens.numel() != 1:
             raise RuntimeError(
-                "Quest reference requires one decode token per request: "
-                f"received {num_tokens} tokens and "
-                f"{attn_metadata.seq_lens.shape[0]} requests."
+                "The Quest MVP currently supports exactly one active "
+                "decode request."
             )
+
+        sequence_length = int(attn_metadata.seq_lens[0].item())
+
+        budget = compute_quest_budget(
+            sequence_length=sequence_length,
+            block_size=page_metadata.block_size,
+            budget_percent=self.quest_page_budget_percent,
+            sparse_start_tokens=self.quest_sparse_start_tokens,
+        )
 
         result = reference_quest_decode(
             query=query[:num_tokens],
@@ -249,13 +340,11 @@ class QuestAttentionImpl(FlashAttentionImpl):
             page_max=page_metadata.key_max,
             block_table=attn_metadata.block_table[:num_tokens],
             seq_lens=attn_metadata.seq_lens[:num_tokens],
-            page_budget=attn_metadata.block_table.shape[1],
+            page_budget=budget.selected_pages,
             block_size=page_metadata.block_size,
             scale=self.scale,
         )
 
-        # vLLM may expose output as either [T, Hq, D] or flattened
-        # [T, Hq * D] storage.
         output_view = output.view(
             output.shape[0],
             self.num_heads,
@@ -264,6 +353,7 @@ class QuestAttentionImpl(FlashAttentionImpl):
         output_view[:num_tokens].copy_(result.output)
 
         return output
+
 
     @staticmethod
     def _requires_dense_phase(
